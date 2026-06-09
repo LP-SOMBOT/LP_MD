@@ -26,20 +26,13 @@ const pingCommand = require("./commands/ping");
 const leftCommand = require("./commands/left");
 const { antilinkCommand, antilinkFilter } = require("./commands/antilink");
 
-// ─── Express App (Pairing Site + API) ────────────────────────────────────────
+// ─── Express App ─────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "pairing-site")));
 
-// Temporary store: phone → { socket, resolve }
-const pairingRequests = {};
-
-/**
- * POST /api/pair
- * Body: { phone: "2521234567" }
- * Returns: { code: "ABCD-1234" }
- */
+// POST /api/pair  →  { code: "XXXX-XXXX" }
 app.post("/api/pair", async (req, res) => {
   const phone = (req.body.phone || "").replace(/\D/g, "");
 
@@ -47,82 +40,106 @@ app.post("/api/pair", async (req, res) => {
     return res.status(400).json({ error: "Invalid phone number" });
   }
 
-  // Set a long timeout so Render doesn't close the connection early
-  res.setTimeout(60000);
+  res.setTimeout(90000);
 
   try {
     const code = await generatePairingCode(phone);
-    // Cleanup temp dir after success
-    const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
-    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
     res.json({ code });
   } catch (err) {
     console.error("[PAIR] Error:", err.message);
-    // Cleanup temp dir on failure too
-    const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
-    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
-    res.status(500).json({ error: "Failed to generate code: " + err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Pairing Socket ───────────────────────────────────────────────────────────
-
-let pairingSock = null;
+// ─── Pairing Code Generator ───────────────────────────────────────────────────
 
 async function generatePairingCode(phone) {
   return new Promise(async (resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("Timeout: Could not generate pairing code in 30 seconds"));
-    }, 30000);
-
     let settled = false;
-    const done = (fn, val) => {
+    let sock = null;
+
+    const timeout = setTimeout(() => {
+      done(reject, new Error("Timeout: WhatsApp did not respond in 60 seconds. Please try again."));
+    }, 60000);
+
+    function done(fn, val) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      try { if (sock) sock.end(new Error("pairing-done")); } catch (_) {}
       fn(val);
-    };
+    }
 
     try {
-      // Use a fresh temp folder per phone so old creds don't interfere
+      // Fresh credentials every time — stale creds break pairing silently
       const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
       if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
       fs.mkdirSync(tmpDir, { recursive: true });
 
       const { state, saveCreds } = await useMultiFileAuthState(tmpDir);
-      const { version } = await fetchLatestBaileysVersion();
 
-      const sock = makeWASocket({
+      // Fetch latest WA version; fall back to known-good if fetch fails
+      let version;
+      try {
+        const r = await fetchLatestBaileysVersion();
+        version = r.version;
+        console.log("[PAIR] WA version:", version);
+      } catch (_) {
+        version = [2, 3000, 1015901307];
+        console.log("[PAIR] Using fallback WA version");
+      }
+
+      sock = makeWASocket({
         version,
         logger: pino({ level: "silent" }),
         printQRInTerminal: false,
         auth: state,
-        browser: ["Ubuntu", "Chrome", "22.04.4"],
-        mobile: false,
+        browser: ["Chrome (Linux)", "", ""],
+        markOnlineOnConnect: false,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
       });
 
       sock.ev.on("creds.update", saveCreds);
 
+      let codeRequested = false;
+
       sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
 
-        if (connection === "open") {
-          // Socket is fully open — now request the pairing code
-          try {
-            if (!sock.authState.creds.registered) {
+        console.log("[PAIR] connection.update:", connection);
+
+        // Request pairing code on first "connecting" or "open" event
+        if (!codeRequested && !sock.authState.creds.registered) {
+          if (connection === "connecting" || connection === "open") {
+            codeRequested = true;
+            try {
+              // Give WS handshake 1.5s to settle before requesting
+              await new Promise(r => setTimeout(r, 1500));
+              console.log("[PAIR] Requesting pairing code for", phone);
               const code = await sock.requestPairingCode(phone);
-              done(resolve, code.match(/.{1,4}/g).join("-"));
-            } else {
-              done(reject, new Error("This number is already registered/paired"));
+              console.log("[PAIR] Raw code:", code);
+              if (!code) return done(reject, new Error("WhatsApp returned an empty code"));
+              const clean = code.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+              const formatted = clean.match(/.{1,4}/g).join("-");
+              done(resolve, formatted);
+            } catch (err) {
+              console.error("[PAIR] requestPairingCode error:", err.message);
+              done(reject, new Error("WhatsApp rejected the request: " + err.message));
             }
-          } catch (err) {
-            done(reject, err);
           }
         }
 
         if (connection === "close") {
           const statusCode = lastDisconnect?.error?.output?.statusCode;
-          done(reject, new Error("Connection closed before pairing (code " + statusCode + ")"));
+          console.log("[PAIR] Connection closed, status:", statusCode);
+          if (!settled) {
+            done(reject, new Error("Connection closed (status " + statusCode + "). Try again."));
+          }
+          // Clean up tmp dir
+          const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
+          try { if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
         }
       });
 
@@ -135,7 +152,6 @@ async function generatePairingCode(phone) {
 // ─── Main Bot Connection ──────────────────────────────────────────────────────
 
 async function startBot() {
-  // Load session from env variable if provided
   if (config.sessionId) {
     loadSessionFromId(config.sessionId);
   }
@@ -145,7 +161,14 @@ async function startBot() {
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+
+  let version;
+  try {
+    const r = await fetchLatestBaileysVersion();
+    version = r.version;
+  } catch (_) {
+    version = [2, 3000, 1015901307];
+  }
 
   const sock = makeWASocket({
     version,
@@ -155,39 +178,34 @@ async function startBot() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
     },
-    browser: ["LP_MD", "Chrome", "1.0.0"],
+    browser: ["Chrome (Linux)", "", ""],
     getMessage: async () => ({ conversation: "" }),
   });
 
-  // ── Save credentials on update ──
   sock.ev.on("creds.update", saveCreds);
 
-  // ── Connection state handler ──
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log("[BOT] ⚠️  No session found. Please use the pairing site to connect.");
+      console.log("[BOT] No session found. Use the pairing site to connect.");
     }
 
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
       console.log(`[BOT] Connection closed (${statusCode}). Reconnecting: ${shouldReconnect}`);
-
       if (shouldReconnect) {
         setTimeout(startBot, 5000);
       } else {
-        console.log("[BOT] ❌ Logged out. Delete the session folder and re-pair.");
+        console.log("[BOT] Logged out. Delete session folder and re-pair.");
         process.exit(1);
       }
     }
 
     if (connection === "open") {
-      console.log("[BOT] ✅ LP_MD is now connected!");
+      console.log("[BOT] LP_MD is now connected!");
 
-      // Encode and log session ID (for new pairings)
       const sessionId = encodeSessionToId();
       if (sessionId) {
         console.log("\n╔══════════════════════════════════════════╗");
@@ -196,7 +214,6 @@ async function startBot() {
         console.log(sessionId);
         console.log("══════════════════════════════════════════\n");
 
-        // Send session ID + live message to owner's DM
         const ownerJid = `${config.ownerNumber}@s.whatsapp.net`;
         await sock.sendMessage(ownerJid, {
           text:
@@ -207,15 +224,13 @@ async function startBot() {
     }
   });
 
-  // ── Message handler ──
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
-
     for (const msg of messages) {
       try {
         await handleMessage(sock, msg);
       } catch (err) {
-        console.error("[BOT] Message handling error:", err.message);
+        console.error("[BOT] Message error:", err.message);
       }
     }
   });
@@ -225,8 +240,8 @@ async function startBot() {
 
 async function handleMessage(sock, msg) {
   if (!msg.message) return;
-  if (msg.key.fromMe) return; // ignore own messages
-  if (isJidBroadcast(msg.key.remoteJid)) return; // ignore broadcast
+  if (msg.key.fromMe) return;
+  if (isJidBroadcast(msg.key.remoteJid)) return;
 
   const jid = msg.key.remoteJid;
   const isGroup = jid.endsWith("@g.us");
@@ -238,16 +253,12 @@ async function handleMessage(sock, msg) {
     msg.message?.videoMessage?.caption ||
     "";
 
-  // ── Antilink filter (runs on all group messages) ──
   if (isGroup) {
     let groupMetadata = null;
-    try {
-      groupMetadata = await sock.groupMetadata(jid);
-    } catch {}
+    try { groupMetadata = await sock.groupMetadata(jid); } catch {}
     await antilinkFilter(sock, msg, groupMetadata);
   }
 
-  // ── Command routing ──
   if (!body.startsWith(config.prefix)) return;
 
   const [rawCommand, ...args] = body.slice(config.prefix.length).trim().split(/\s+/);
@@ -256,32 +267,18 @@ async function handleMessage(sock, msg) {
   console.log(`[CMD] ${command} | from: ${msg.key.participant || jid}`);
 
   switch (command) {
-    case "menu":
-      await menuCommand(sock, msg);
-      break;
-
-    case "ping":
-      await pingCommand(sock, msg);
-      break;
-
-    case "left":
-      await leftCommand(sock, msg);
-      break;
-
-    case "antilink":
-      await antilinkCommand(sock, msg, args);
-      break;
-
-    default:
-      // Unknown command — silent ignore
-      break;
+    case "menu":   await menuCommand(sock, msg); break;
+    case "ping":   await pingCommand(sock, msg); break;
+    case "left":   await leftCommand(sock, msg); break;
+    case "antilink": await antilinkCommand(sock, msg, args); break;
+    default: break;
   }
 }
 
-// ─── Start Everything ─────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 
 app.listen(config.port, () => {
-  console.log(`[SERVER] 🌐 Pairing site running at http://localhost:${config.port}`);
+  console.log(`[SERVER] Pairing site running at http://localhost:${config.port}`);
 });
 
 startBot().catch((err) => {
