@@ -47,12 +47,21 @@ app.post("/api/pair", async (req, res) => {
     return res.status(400).json({ error: "Invalid phone number" });
   }
 
+  // Set a long timeout so Render doesn't close the connection early
+  res.setTimeout(60000);
+
   try {
     const code = await generatePairingCode(phone);
+    // Cleanup temp dir after success
+    const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
+    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
     res.json({ code });
   } catch (err) {
     console.error("[PAIR] Error:", err.message);
-    res.status(500).json({ error: "Failed to generate code. Try again." });
+    // Cleanup temp dir on failure too
+    const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
+    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
+    res.status(500).json({ error: "Failed to generate code: " + err.message });
   }
 });
 
@@ -62,13 +71,25 @@ let pairingSock = null;
 
 async function generatePairingCode(phone) {
   return new Promise(async (resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timeout")), 30000);
+    const timeout = setTimeout(() => {
+      reject(new Error("Timeout: Could not generate pairing code in 30 seconds"));
+    }, 30000);
+
+    let settled = false;
+    const done = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      fn(val);
+    };
 
     try {
-      const { state, saveCreds } = await useMultiFileAuthState(
-        path.join(__dirname, "session_pair_" + phone)
-      );
+      // Use a fresh temp folder per phone so old creds don't interfere
+      const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
+      if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
+      fs.mkdirSync(tmpDir, { recursive: true });
 
+      const { state, saveCreds } = await useMultiFileAuthState(tmpDir);
       const { version } = await fetchLatestBaileysVersion();
 
       const sock = makeWASocket({
@@ -76,7 +97,8 @@ async function generatePairingCode(phone) {
         logger: pino({ level: "silent" }),
         printQRInTerminal: false,
         auth: state,
-        browser: ["LP_MD", "Chrome", "1.0.0"],
+        browser: ["Ubuntu", "Chrome", "22.04.4"],
+        mobile: false,
       });
 
       sock.ev.on("creds.update", saveCreds);
@@ -84,16 +106,28 @@ async function generatePairingCode(phone) {
       sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
 
-        if (!sock.authState.creds.registered) {
-          await sock.waitForSocketOpen();
-          const code = await sock.requestPairingCode(phone);
-          clearTimeout(timeout);
-          resolve(code.match(/.{1,4}/g).join("-")); // Format: XXXX-XXXX
+        if (connection === "open") {
+          // Socket is fully open — now request the pairing code
+          try {
+            if (!sock.authState.creds.registered) {
+              const code = await sock.requestPairingCode(phone);
+              done(resolve, code.match(/.{1,4}/g).join("-"));
+            } else {
+              done(reject, new Error("This number is already registered/paired"));
+            }
+          } catch (err) {
+            done(reject, err);
+          }
+        }
+
+        if (connection === "close") {
+          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          done(reject, new Error("Connection closed before pairing (code " + statusCode + ")"));
         }
       });
+
     } catch (err) {
-      clearTimeout(timeout);
-      reject(err);
+      done(reject, err);
     }
   });
 }
