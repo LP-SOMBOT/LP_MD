@@ -1,6 +1,5 @@
 // ╔══════════════════════════════════════════════╗
 // ║              LP_MD WhatsApp Bot              ║
-// ║         github.com/LP-SOMBOT/LP_MD           ║
 // ╚══════════════════════════════════════════════╝
 
 const {
@@ -11,12 +10,13 @@ const {
   makeCacheableSignalKeyStore,
   isJidBroadcast,
   Browsers,
+  delay,
 } = require("@whiskeysockets/baileys");
 
-const pino = require("pino");
+const pino    = require("pino");
 const express = require("express");
-const path = require("path");
-const fs = require("fs");
+const path    = require("path");
+const fs      = require("fs");
 
 const config = require("./config");
 const { loadSessionFromId, encodeSessionToId, SESSION_DIR } = require("./lib/session");
@@ -33,44 +33,50 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "pairing-site")));
 
 app.post("/api/pair", async (req, res) => {
-  const phone = (req.body.phone || "").replace(/\D/g, "");
+  // E.164 without '+': digits only
+  const phone = (req.body.phone || "").replace(/[^0-9]/g, "");
+
   if (!phone || phone.length < 7) {
-    return res.status(400).json({ error: "Invalid phone number" });
+    return res.status(400).json({ error: "Enter your number with country code, no + sign. Example: 252613982172" });
   }
+
   res.setTimeout(90000);
   try {
     const code = await generatePairingCode(phone);
     res.json({ code });
   } catch (err) {
-    console.error("[PAIR] Error:", err.message);
+    console.error("[PAIR] Failed:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ─── Pairing Code Generator ───────────────────────────────────────────────────
+// Based on confirmed working pattern from Baileys issues #2306, #2008, #390
 
 async function generatePairingCode(phone) {
-  const tmpDir = path.join(__dirname, ".pair_tmp_" + phone);
-
-  // Always start fresh — stale creds cause bad-request errors
-  if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
+  // Fresh credentials every time — stale creds silently break pairing
+  const tmpDir = path.join(__dirname, ".pair_" + phone + "_" + Date.now());
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  let sock = null;
+  const cleanup = () => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  };
 
   return new Promise(async (resolve, reject) => {
-    let settled = false;
+    let settled       = false;
+    let pairingDone   = false;
+    let sock          = null;
 
     const timer = setTimeout(() => {
-      finish(reject, new Error("Timeout: WhatsApp did not respond. Try again."));
+      finish(reject, new Error("Timeout: WhatsApp servers did not respond. Try again in a moment."));
     }, 60000);
 
     function finish(fn, val) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { if (sock) sock.end(new Error("done")); } catch (_) {}
-      try { if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+      cleanup();
+      try { sock?.end(new Error("done")); } catch (_) {}
       fn(val);
     }
 
@@ -79,10 +85,11 @@ async function generatePairingCode(phone) {
 
       let version;
       try {
-        const r = await fetchLatestBaileysVersion();
-        version = r.version;
+        ({ version } = await fetchLatestBaileysVersion());
+        console.log("[PAIR] WA version:", version);
       } catch (_) {
         version = [2, 3000, 1015901307];
+        console.log("[PAIR] Using fallback WA version");
       }
 
       sock = makeWASocket({
@@ -90,50 +97,56 @@ async function generatePairingCode(phone) {
         logger: pino({ level: "silent" }),
         printQRInTerminal: false,
         auth: state,
-        browser: Browsers.ubuntu("Chrome"),
+        // Confirmed working browser config (issue #1382 fix)
+        browser: ["Windows", "Chrome", "114.0.5735.198"],
         markOnlineOnConnect: false,
+        // CRITICAL: undefined removes the timeout that causes Connection Closed on cloud (issue #390)
+        defaultQueryTimeoutMs: undefined,
         connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        qrTimeout: undefined,
       });
 
       sock.ev.on("creds.update", saveCreds);
 
-      // ── KEY FIX: request the code OUTSIDE connection.update, right here ──
-      // Wait until the socket's WS is open (readyState === 1)
-      // then call requestPairingCode immediately
-      if (!state.creds.registered) {
-        // Poll until WS is open (max 15s)
-        let waited = 0;
-        const waitForWS = setInterval(async () => {
-          waited += 200;
-          const wsReady = sock.ws && (sock.ws.readyState === 1 || sock.ws.isOpen === true);
+      sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        console.log("[PAIR] connection.update → connection:", connection, "| qr:", !!qr);
 
-          if (wsReady || waited >= 15000) {
-            clearInterval(waitForWS);
-            if (!wsReady) {
-              return finish(reject, new Error("WebSocket did not open. Check Render logs."));
+        // ── Correct trigger: request pairing code ONLY when QR fires ──
+        // QR firing means the WS is fully open and ready for auth
+        if (qr && !pairingDone && !sock.authState.creds.registered) {
+          pairingDone = true;
+          try {
+            // Small delay to ensure socket is stable
+            await delay(500);
+            console.log("[PAIR] Requesting pairing code for number:", phone);
+            const code = await sock.requestPairingCode(phone);
+            console.log("[PAIR] Raw code received:", code);
+
+            if (!code) {
+              return finish(reject, new Error("WhatsApp returned an empty pairing code. Try again."));
             }
-            try {
-              console.log("[PAIR] Requesting code for", phone);
-              const code = await sock.requestPairingCode(phone);
-              console.log("[PAIR] Code received:", code);
-              if (!code) return finish(reject, new Error("WhatsApp returned empty code"));
-              const formatted = code.replace(/[^A-Z0-9]/gi,"").toUpperCase().match(/.{1,4}/g).join("-");
-              finish(resolve, formatted);
-            } catch (err) {
-              console.error("[PAIR] requestPairingCode threw:", err.message);
-              finish(reject, new Error(err.message));
-            }
+
+            // Format XXXXXXXX → XXXX-XXXX
+            const formatted = String(code)
+              .replace(/[^A-Z0-9]/gi, "")
+              .toUpperCase()
+              .match(/.{1,4}/g)
+              ?.join("-") || code;
+
+            console.log("[PAIR] Formatted code:", formatted);
+            finish(resolve, formatted);
+          } catch (err) {
+            console.error("[PAIR] requestPairingCode error:", err.message);
+            finish(reject, new Error("Failed to get code from WhatsApp: " + err.message));
           }
-        }, 200);
-      } else {
-        finish(reject, new Error("Number already paired. Delete session and retry."));
-      }
+        }
 
-      sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
         if (connection === "close" && !settled) {
-          const code = lastDisconnect?.error?.output?.statusCode;
-          finish(reject, new Error("Connection closed (status " + code + "). Try again."));
+          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          console.log("[PAIR] Connection closed, status:", statusCode);
+          finish(reject, new Error("Connection was closed (status " + statusCode + "). Try again."));
         }
       });
 
@@ -143,7 +156,7 @@ async function generatePairingCode(phone) {
   });
 }
 
-// ─── Main Bot ─────────────────────────────────────────────────────────────────
+// ─── Main Bot Connection ──────────────────────────────────────────────────────
 
 async function startBot() {
   if (config.sessionId) loadSessionFromId(config.sessionId);
@@ -152,7 +165,7 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
   let version;
-  try { version = (await fetchLatestBaileysVersion()).version; }
+  try { ({ version } = await fetchLatestBaileysVersion()); }
   catch (_) { version = [2, 3000, 1015901307]; }
 
   const sock = makeWASocket({
@@ -165,30 +178,34 @@ async function startBot() {
     },
     browser: Browsers.ubuntu("Chrome"),
     getMessage: async () => ({ conversation: "" }),
+    defaultQueryTimeoutMs: undefined,
   });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
-    if (qr) console.log("[BOT] No session. Use the pairing site to connect.");
+    if (qr) console.log("[BOT] No session. Use the pairing site at your Render URL.");
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const reconnect = code !== DisconnectReason.loggedOut;
-      console.log(`[BOT] Closed (${code}). Reconnect: ${reconnect}`);
+      console.log(`[BOT] Disconnected (${code}). Reconnecting: ${reconnect}`);
       if (reconnect) setTimeout(startBot, 5000);
-      else { console.log("[BOT] Logged out."); process.exit(1); }
+      else { console.log("[BOT] Logged out. Re-pair from the pairing site."); process.exit(1); }
     }
 
     if (connection === "open") {
-      console.log("[BOT] Connected!");
+      console.log("[BOT] ✅ LP_MD is online!");
       const sessionId = encodeSessionToId();
       if (sessionId) {
-        console.log("\n═══ SESSION ID ═══\n" + sessionId + "\n══════════════════\n");
-        const ownerJid = `${config.ownerNumber}@s.whatsapp.net`;
-        await sock.sendMessage(ownerJid, {
-          text: `🔑 *Session ID:*\n\`\`\`${sessionId}\`\`\`\n\n` + config.botLiveMessage,
-        });
+        console.log("\n═══════════════════════════════");
+        console.log("SESSION ID:\n" + sessionId);
+        console.log("═══════════════════════════════\n");
+        try {
+          await sock.sendMessage(`${config.ownerNumber}@s.whatsapp.net`, {
+            text: `🔑 *LP_MD Session ID:*\n\`\`\`${sessionId}\`\`\`\n\n` + config.botLiveMessage,
+          });
+        } catch (_) {}
       }
     }
   });
@@ -197,17 +214,19 @@ async function startBot() {
     if (type !== "notify") return;
     for (const msg of messages) {
       try { await handleMessage(sock, msg); }
-      catch (err) { console.error("[BOT]", err.message); }
+      catch (err) { console.error("[BOT] Message error:", err.message); }
     }
   });
 }
 
+// ─── Message Handler ──────────────────────────────────────────────────────────
+
 async function handleMessage(sock, msg) {
   if (!msg.message || msg.key.fromMe || isJidBroadcast(msg.key.remoteJid)) return;
 
-  const jid = msg.key.remoteJid;
+  const jid     = msg.key.remoteJid;
   const isGroup = jid.endsWith("@g.us");
-  const body =
+  const body    =
     msg.message?.conversation ||
     msg.message?.extendedTextMessage?.text ||
     msg.message?.imageMessage?.caption ||
@@ -215,7 +234,7 @@ async function handleMessage(sock, msg) {
 
   if (isGroup) {
     let meta = null;
-    try { meta = await sock.groupMetadata(jid); } catch {}
+    try { meta = await sock.groupMetadata(jid); } catch (_) {}
     await antilinkFilter(sock, msg, meta);
   }
 
@@ -223,7 +242,7 @@ async function handleMessage(sock, msg) {
 
   const [rawCmd, ...args] = body.slice(config.prefix.length).trim().split(/\s+/);
   const cmd = rawCmd.toLowerCase();
-  console.log(`[CMD] ${cmd} from ${msg.key.participant || jid}`);
+  console.log(`[CMD] "${cmd}" from ${msg.key.participant || jid}`);
 
   switch (cmd) {
     case "menu":     await menuCommand(sock, msg); break;
@@ -236,10 +255,10 @@ async function handleMessage(sock, msg) {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 app.listen(config.port, () => {
-  console.log(`[SERVER] Pairing site at http://localhost:${config.port}`);
+  console.log(`[SERVER] Pairing site live at http://localhost:${config.port}`);
 });
 
 startBot().catch(err => {
-  console.error("[BOT] Fatal:", err);
+  console.error("[BOT] Fatal:", err.message);
   process.exit(1);
 });
